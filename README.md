@@ -134,7 +134,7 @@ Works using Python + available GUI frameworks (e.g., Tkinter, PyQt, or OpenCV im
 > [!NOTE]
 > The following figure shows the **general flowchart** of `main.py` for the robot car: it loads the configuration, initializes the motor, steering, distance sensors, optional vision module and graphical interface; then it enters a loop where it reads all sensors, processes the camera if it is enabled, computes speed and steering, updates the interface, and when an exit is requested, it stops the car and releases resources.
 
-![Control flow diagram](<t-photos/Diagrama de Flujo.png>)
+![Control flow diagram](<other/Diagrama de Flujo.png>)
 
 ---
 
@@ -155,7 +155,7 @@ The following list summarizes the mapping between code modules and physical hard
 > [!NOTE]
 > The following figure shows the **General Wiring Diagram** of the robot car: a Raspberry Pi 4 is connected to the steering servo, the DC drive motor and the distance sensors (two VL53L0X ToF modules and two HC-SR04 ultrasonic modules), while all components are powered from a Li-Po battery through a main switch and a step-down regulator, sharing a common ground.
 
-![General circuit diagram](<t-photos/3. Circuito general gráfico.png>)
+![General circuit diagram](<schemes/3. Circuito general gráfico.png>)
 
 ---
 
