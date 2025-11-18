@@ -134,7 +134,7 @@ Works using Python + available GUI frameworks (e.g., Tkinter, PyQt, or OpenCV im
 > [!NOTE]
 > The following figure shows the **general flowchart** of `main.py` for the robot car: it loads the configuration, initializes the motor, steering, distance sensors, optional vision module and graphical interface; then it enters a loop where it reads all sensors, processes the camera if it is enabled, computes speed and steering, updates the interface, and when an exit is requested, it stops the car and releases resources.
 
-![Control flow diagram](<other/Diagrama de Flujo.png>)
+![Control flow diagram](<other/Flowchart.png>)
 
 ---
 
