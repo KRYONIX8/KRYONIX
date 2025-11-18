@@ -147,7 +147,9 @@ The following list summarizes the mapping between code modules and physical hard
 | `gui_interface.py`     | Raspberry Pi       | Visualization of robot state    |
 | `main.py`              | Entire Robot       | Integrates all behavior         |
 
-General wiring/connection diagram here:
+General wiring/connection diagram:
+
+![General circuit diagram](<t-photos/3. Circuito general gráfico.png>)
 
 <!-- Insert wiring diagram image -->
 
@@ -234,6 +236,44 @@ The program will start running immediately, activating:
 
 This project is open-source and licensed under the MIT License.
 
----
+flowchart TD
+    A[main.py<br>Start] --> B[Load config & libraries]
+    B --> C[Initialize hardware interfaces<br>GPIO, I2C, PWM]
 
-Con esto, en el preview de GitHub esos tres puntos del índice ya deberían verse azules y llevarte exactamente a cada sección.
+    C --> D[Init motor_control<br>DC motor + DRV8870]
+    C --> E[Init servo_steering<br>MG996R]
+    C --> F[Init ultrasonic_module<br>HC-SR04 front/rear]
+    C --> G[Init tof_module<br>VL53L0X left/right]
+
+    C --> H{Vision enabled?}
+    H -->|Yes| I[Init vision_module<br>Webcam]
+    H -->|No| J[Skip vision]
+
+    C --> K[Init gui_interface<br>Window, labels, tables]
+
+    K --> L{{Main loop}}
+
+    L --> M[Read distances<br>ultrasonic_module]
+    L --> N[Read distances<br>tof_module]
+
+    L --> O{Vision enabled?}
+    O -->|Yes| P[Capture & process frame<br>vision_module]
+    O -->|No| Q[Use only distance sensors]
+
+    P --> R[Build perception state]
+    N --> R
+    M --> R
+    Q --> R
+
+    R --> S[Compute navigation decision<br>(routine logic in main.py)]
+
+    S --> T[Update motor_control<br>speed & direction]
+    S --> U[Update servo_steering<br>steering angle]
+
+    S --> V[Update gui_interface<br>camera, speeds, angles,<br>sensor table, status text]
+
+    V --> W{Exit requested?<br>button / key / error}
+    W -->|No| L
+    W -->|Yes| X[Stop motors, center servo]
+    X --> Y[Release resources<br>GPIO.cleanup(), close GUI]
+    Y --> Z[End]
