@@ -155,7 +155,7 @@ The following list summarizes the mapping between code modules and physical hard
 > [!NOTE]
 > The following figure shows the **General Wiring Diagram** of the robot car: a Raspberry Pi 4 is connected to the steering servo, the DC drive motor and the distance sensors (two VL53L0X ToF modules and two HC-SR04 ultrasonic modules), while all components are powered from a Li-Po battery through a main switch and a step-down regulator, sharing a common ground.
 
-![General circuit diagram](<schemes/3. Circuito general gráfico.png>)
+![General circuit diagram](<schemes/3. General Circuit Diagram.png>)
 
 ---
 
