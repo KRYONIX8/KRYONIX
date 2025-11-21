@@ -1,4 +1,3 @@
-
 ## 𝄜 Table of Contents
 
 * [Autonomous Steering-Wheel Robot Car – Control System & Software Architecture](#autonomous-steering-wheel-robot-car--control-system--software-architecture)
@@ -21,8 +20,8 @@
 
 # Autonomous Steering-Wheel Robot Car – Control System & Software Architecture
 
-This repository contains the complete documentation and software for an autonomous robot car using a steering-wheel (Ackermann-style) mechanism.
-The system integrates a **Raspberry Pi 4**, an **MG996R servo**, a **DC motor controlled with DRV8870**, and a full sensor suite consisting of **two HC-SR04 ultrasonic sensors** and **two VL53L0X laser time-of-flight sensors**.
+This repository contains the complete documentation and software for an autonomous robot car using a steering-wheel (Ackermann-style) mechanism.  
+The system integrates a **Raspberry Pi 4**, an **MG996R servo**, a **DC motor controlled with a BTS7960 high-current H-bridge driver (IBT-2 / HW-039 module)**, and a full sensor suite consisting of **two HC-SR04 ultrasonic sensors** and **two VL53L0X laser time-of-flight sensors**.  
 The purpose of this documentation is to describe:
 
 * The architecture of the software developed.
@@ -34,104 +33,110 @@ The purpose of this documentation is to describe:
 
 ## ➔ System Overview
 
-The robot is a semi-autonomous vehicle designed for navigation, obstacle avoidance, and directional control using vision and distance sensing.
-The Raspberry Pi 4 acts as the **primary controller** while the DRV8870 and MG996R interface provide the mechanical actuation of propulsion and steering.
+The robot is a semi-autonomous vehicle designed for navigation, obstacle avoidance, and directional control using vision and distance sensing.  
+The Raspberry Pi 4 acts as the **primary controller**, while the **BTS7960 driver and MG996R servo** provide the mechanical actuation of propulsion and steering.
 
 The key subsystems are:
 
 ### ◆ 1. Power Distribution  <a id="power-distribution"></a>
 
-* **LiPo 3S (11.1 V)** → main power source
-* **General switch**
-* **XL4016 buck converter** → provides stable 5V for Raspberry Pi and servo
-* **UBEC (optional)** → provides isolated 5V for sensors
-* Ground reference shared across all modules
+* **LiPo 3S (11.1 V)** → main power source  
+* **General switch**  
+* **XL4016 buck converter** → provides stable 5 V for Raspberry Pi and servo  
+* **UBEC (optional)** → provides isolated 5 V for sensors  
+* Ground reference shared across all modules  
 
 ### ◆ 2. Actuation  <a id="actuation"></a>
 
-* **DC Motor** driven by the DRV8870 H-bridge
-* **MG996R Servo** controlling the steering angle
-* PWM and digital outputs from Raspberry Pi for speed and direction
+* **DC Motor** driven by the **BTS7960 H-bridge driver (IBT-2 / HW-039 module)**  
+* **MG996R Servo** controlling the steering angle  
+* PWM and digital outputs from Raspberry Pi for speed and direction  
 
 ### ◆ 3. Sensors  <a id="sensors"></a>
 
-* **HC-SR04 (Front / Rear)**: detects obstacles at medium distance
-* **VL53L0X (Left / Right)**: detects walls or side distances with millimeter precision
-* **Webcam (Front)**: vision input for advanced routines (optional module)
+* **HC-SR04 (Front / Rear)**: detects obstacles at medium distance  
+* **VL53L0X (Left / Right)**: detects walls or side distances with millimeter precision  
+* **Webcam (Front)**: vision input for advanced routines (optional module)  
 
 ---
 
 ## ➔ Code Architecture
 
-The codebase is divided into several logical modules. Each one is responsible for controlling a specific hardware component or algorithm.
+The codebase is divided into several logical modules. Each one is responsible for controlling a specific hardware component or algorithm.  
 Below is a description of each module and how it relates to the physical hardware of the robot.
 
-### ### 1. `motor_control.py`
+### 1. `motor_control.py`
 
-**Purpose:** Control the rotational speed and direction of the DC motor.
+**Purpose:** Control the rotational speed and direction of the DC motor.  
+
 **Electromechanical relation:**
 
-* Sends PWM signals to the **DRV8870 EN pin**
-* Uses digital outputs for **N1/N2** to determine direction
-* Directly affects vehicle propulsion
+* Sends PWM and direction signals to the **BTS7960 control inputs** (e.g., `RPWM/LPWM` and `R_EN/L_EN`)  
+* Interfaces with the **high-current H-bridge stage** that drives the DC motor  
+* Directly affects vehicle propulsion (forward, reverse, and speed regulation)  
 
-### ### 2. `servo_steering.py`
+### 2. `servo_steering.py`
 
-**Purpose:** Turn the steering wheel using the MG996R servo.
+**Purpose:** Turn the steering wheel using the MG996R servo.  
+
 **Electromechanical relation:**
 
-* Requires a **stable 5V line** from XL4016
-* Reads/writes precise PWM signals to position the servo horn
-* Steering angles define the motion path of the robot
+* Requires a **stable 5 V line** from XL4016  
+* Generates precise PWM signals to position the servo horn  
+* Steering angles define the motion path of the robot (left, center, right)  
 
-### ### 3. `ultrasonic_module.py`
+### 3. `ultrasonic_module.py`
 
-**Purpose:** Manage distance readings from the HC-SR04 sensors.
+**Purpose:** Manage distance readings from the HC-SR04 sensors.  
+
 **Electromechanical relation:**
 
-* Uses **5V from UBEC or Pi** and needs common ground
-* TRIG and ECHO connected to RPi GPIO pins
-* Provides centimeter-level detection of frontal and rear obstacles
+* Uses **5 V from UBEC or Raspberry Pi** and needs common ground  
+* TRIG and ECHO are connected to Raspberry Pi GPIO pins  
+* Provides centimeter-level detection of frontal and rear obstacles  
 
-### ### 4. `tof_module.py`
+### 4. `tof_module.py`
 
-**Purpose:** Measure side distances using VL53L0X ToF sensors.
+**Purpose:** Measure side distances using VL53L0X ToF sensors.  
+
 **Electromechanical relation:**
 
-* Communicates via **I2C (SDA/SCL)**
-* Requires 3.3V stable power
-* Provides millimeter-accuracy readings essential for precise navigation
+* Communicates via **I2C (SDA/SCL)**  
+* Requires 3.3 V stable power  
+* Provides millimeter-accuracy readings essential for precise navigation and wall following  
 
-### ### 5. `vision_module.py` (optional)
+### 5. `vision_module.py` (optional)
 
-**Purpose:** Capture and display the webcam feed.
+**Purpose:** Capture and display the webcam feed.  
+
 **Electromechanical relation:**
 
-* Uses USB camera
-* Requires Raspberry Pi 4 performance for real-time processing
+* Uses a USB camera connected to the Raspberry Pi  
+* Requires Raspberry Pi 4 performance for real-time processing  
 
-### ### 6. `gui_interface.py`
+### 6. `gui_interface.py`
 
 **Purpose:** Provide a graphical interface showing:
 
-* Camera feed
-* Motor speed
-* Servo angle
-* Sensor measurement table
-* Text describing the current robot routine
+* Camera feed  
+* Motor speed  
+* Servo angle  
+* Sensor measurement table  
+* Text describing the current robot routine  
 
-Works using Python + available GUI frameworks (e.g., Tkinter, PyQt, or OpenCV imshow).
+Works using Python plus available GUI frameworks (e.g., Tkinter, PyQt, or OpenCV `imshow`).  
 
-### ### 7. `main.py`
+### 7. `main.py`
 
-**Purpose:** Integrate every subsystem, execute routines, and run the robot.
+**Purpose:** Integrate every subsystem, execute routines, and run the robot.  
+
 **Electromechanical relation:**
 
-* Acts as the brain controlling all modules synchronously
-* Makes decisions based on sensor inputs
-* Executes movement commands through the motors and steering
+* Acts as the brain controlling all modules synchronously  
+* Makes decisions based on sensor inputs  
+* Executes movement commands through the **BTS7960-driven motor** and the steering servo  
 
-> [!NOTE]
+> [!NOTE]  
 > The following figure shows the **general flowchart** of `main.py` for the robot car: it loads the configuration, initializes the motor, steering, distance sensors, optional vision module and graphical interface; then it enters a loop where it reads all sensors, processes the camera if it is enabled, computes speed and steering, updates the interface, and when an exit is requested, it stops the car and releases resources.
 
 ![Control flow diagram](<other/Flowchart.png>)
@@ -142,20 +147,20 @@ Works using Python + available GUI frameworks (e.g., Tkinter, PyQt, or OpenCV im
 
 The following list summarizes the mapping between code modules and physical hardware:
 
-| Code Module            | Hardware Component | Purpose                         |
-| ---------------------- | ------------------ | ------------------------------- |
-| `motor_control.py`     | BTS7960 + DC Motor | Speed / direction control       |
-| `servo_steering.py`    | MG996R Servo       | Steering angle                  |
-| `ultrasonic_module.py` | HC-SR04 Sensors    | Front/rear distance detection   |
-| `tof_module.py`        | VL53L0X Sensors    | Left/right distance measurement |
-| `vision_module.py`     | Webcam             | Vision processing               |
-| `gui_interface.py`     | Raspberry Pi       | Visualization of robot state    |
-| `main.py`              | Entire Robot       | Integrates all behavior         |
+| Code Module            | Hardware Component           | Purpose                         |
+| ---------------------- | --------------------------- | ------------------------------- |
+| `motor_control.py`     | BTS7960 + DC Motor          | Speed / direction control       |
+| `servo_steering.py`    | MG996R Servo                | Steering angle                  |
+| `ultrasonic_module.py` | HC-SR04 Sensors             | Front/rear distance detection   |
+| `tof_module.py`        | VL53L0X Sensors             | Left/right distance measurement |
+| `vision_module.py`     | Webcam                      | Vision processing               |
+| `gui_interface.py`     | Raspberry Pi                | Visualization of robot state    |
+| `main.py`              | Entire Robot                | Integrates all behavior         |
 
-> [!NOTE]
-> The following figure shows the **General Wiring Diagram** of the robot car: a Raspberry Pi 4 is connected to the steering servo, the DC drive motor and the distance sensors (two VL53L0X ToF modules and two HC-SR04 ultrasonic modules), while all components are powered from a Li-Po battery through a main switch and a step-down regulator, sharing a common ground.
+> [!NOTE]  
+> The following figure shows the **General Wiring Diagram** of the robot car: a Raspberry Pi 4 is connected to the steering servo, the **BTS7960 driver and DC drive motor**, and the distance sensors (two VL53L0X ToF modules and two HC-SR04 ultrasonic modules), while all components are powered from a Li-Po battery through a main switch and a step-down regulator, sharing a common ground.
 
-![General circuit diagram](<schemes/3. General Circuit Diagram.png>)
+![General circuit diagram](<src/3. General Circuit Diagram.png>)
 
 ---
 
@@ -167,28 +172,28 @@ The following list summarizes the mapping between code modules and physical hard
 
 The entire development process is performed directly on the Raspberry Pi OS using **Geany**, a lightweight IDE.
 
-> [!NOTE]
+> [!NOTE]  
 > **Geany** is a simple but powerful IDE available in Raspberry Pi OS, capable of handling Python scripts with syntax highlighting and run support.
 
 ### **Steps:**
 
-1. Open Geany in Raspberry Pi OS.
+1. Open Geany in Raspberry Pi OS.  
 
    <!-- Add image: Geany icon or desktop -->
 
    <!-- ![Open Geany](docs/images/open-geany.png) -->
 
-2. Create a new file or open an existing `.py` file.
+2. Create a new file or open an existing `.py` file.  
 
    <!-- Add image showing unsaved code -->
 
-3. Write your Python code normally.
+3. Write your Python code normally.  
    Geany automatically provides indentation, coloring, and Python formatting.
 
-4. Save the file with the `.py` extension.
+4. Save the file with the `.py` extension.  
    Example: `main.py`
 
-> [!TIP]
+> [!TIP]  
 > Once saved with `.py`, Geany automatically treats the file as a Python script.
 
 ---
@@ -197,7 +202,7 @@ The entire development process is performed directly on the Raspberry Pi OS usin
 
 To run your script:
 
-1. Open the Raspberry Pi OS terminal.
+1. Open the Raspberry Pi OS terminal.  
 
    <!-- Add image: Terminal window -->
 
@@ -205,7 +210,7 @@ To run your script:
 
 ```bash
 cd /home/pi/my_robot_code/
-```
+````
 
 3. Execute the script with:
 
@@ -218,7 +223,7 @@ Replace `my_script.py` with your actual filename.
 The program will start running immediately, activating:
 
 * Sensor readings
-* Motor control
+* Motor control (through the BTS7960 driver)
 * Steering
 * GUI
 * Optional vision modules
