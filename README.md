@@ -144,7 +144,7 @@ The following list summarizes the mapping between code modules and physical hard
 
 | Code Module            | Hardware Component | Purpose                         |
 | ---------------------- | ------------------ | ------------------------------- |
-| `motor_control.py`     | DRV8870 + DC Motor | Speed / direction control       |
+| `motor_control.py`     | BTS7960 + DC Motor | Speed / direction control       |
 | `servo_steering.py`    | MG996R Servo       | Steering angle                  |
 | `ultrasonic_module.py` | HC-SR04 Sensors    | Front/rear distance detection   |
 | `tof_module.py`        | VL53L0X Sensors    | Left/right distance measurement |
