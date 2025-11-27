@@ -1,527 +1,720 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-import time
 import cv2
+import time
+import threading
 import numpy as np
+import traceback
+import json
+import os
+from flask import Flask, render_template_string, Response, jsonify, request
 import RPi.GPIO as GPIO
+import board
+import busio
+from adafruit_vl53l0x import VL53L0X
 
-# -------------------------------------------------
-# CONFIGURACIÓN GENERAL
-# -------------------------------------------------
+# ==========================================
+# 1. CONFIGURACIÓN Y PINES
+# ==========================================
+TRIG_FRONT = 23
+ECHO_FRONT = 24
+XSHUT_LEFT = 5
+XSHUT_RIGHT = 6
+SERVO_PIN = 18
+MOTOR_RPWM = 12
+MOTOR_LPWM = 13
+MOTOR_ENABLE = 19
 
-# True  -> trayectoria HORARIA (gira a DERECHA)
-# False -> trayectoria ANTIHORARIA (gira a IZQUIERDA)
-CLOCKWISE = True
+# Pines del Switch de Competencia
+SWITCH_PWR_PIN = 8   # Salida 3.3V
+SWITCH_READ_PIN = 11 # Entrada
 
-# Vueltas a dar y tiempo aproximado por vuelta
-NUM_LAPS = 3
-LAP_TIME_SEC = 25.0  # AJUSTAR EN PISTA REAL
+# Resolución optimizada para velocidad
+FRAME_WIDTH = 160
+FRAME_HEIGHT = 120
+CONFIG_FILE = "robot_config.json"
 
-# -------------------------------------------------
-# PINES (según tu conexión)
-# -------------------------------------------------
-
-# Motor DC (DRV8870)
-PIN_MOTOR_N1 = 20       # IN1
-PIN_MOTOR_N2 = 21       # IN2
-PIN_MOTOR_EN = 25       # Enable (PWM)
-
-# Servo MG996R
-PIN_SERVO = 18          # GPIO18, PWM HW
-
-# HC-SR04 frontal
-PIN_TRIG_FRONT = 23
-PIN_ECHO_FRONT = 24
-
-# HC-SR04 trasero
-PIN_TRIG_BACK = 5
-PIN_ECHO_BACK = 6
-
-# VL53L0X (XSHUT)
-PIN_XSHUT_RIGHT = 17    # derecha
-PIN_XSHUT_LEFT = 27     # izquierda
-
-# -------------------------------------------------
-# PARÁMETROS DEL CONTROL
-# -------------------------------------------------
-
-# Servo (duty cycle aproximado, AJUSTAR)
-SERVO_CENTER = 7.5
-SERVO_RIGHT  = 6.0
-SERVO_LEFT   = 9.0
-
-# Motor (PWM 0–100)
-MOTOR_SPEED_MAX  = 90
-MOTOR_SPEED_SLOW = 60
-
-# Distancias de seguridad (cm)
-FRONT_STOP_DIST = 25.0
-BACK_SAFE_DIST  = 15.0
-
-# Visión
-WHITE_GO_THRESHOLD   = 0.65
-WHITE_LOST_THRESHOLD = 0.45
-MAX_TURN_TIME        = 3.0
-
-# -------------------------------------------------
-# VARIABLES DE ESTADO (para GUI)
-# -------------------------------------------------
-current_motor_speed = 0      # -100..100 (signo = sentido)
-current_servo_duty = SERVO_CENTER
-current_routine = "Iniciando..."
-last_distances_mm = {
-    "front": None,
-    "back": None,
-    "right": None,
-    "left": None,
+# Configuración Por Defecto
+default_config = {
+    # Visión
+    "black_max_v": 80,    
+    "white_min_v": 160,   
+    "sat_min": 60,        
+    "orange_hue": 15,     
+    "blue_hue": 110,      
+    "hue_margin": 20,
+    "roi_top": 30,    
+    "roi_bottom": 100, 
+    
+    # Navegación
+    "base_speed": 60,       
+    "reverse_speed": 50,    
+    "reverse_time": 0.8,    
+    "min_front_dist": 30,   # Distancia choque frontal
+    "slow_dist": 100,       
+    "side_stuck_dist": 75,  # NUEVO: Distancia para considerar atasco lateral (mm)
+    
+    # Servo
+    "servo_center": 70,
+    "servo_min": 40,
+    "servo_max": 100
 }
 
-# -------------------------------------------------
-# INICIALIZACIÓN GPIO
-# -------------------------------------------------
+# Estado Global
+robot_state = {
+    "mode": "Manual",
+    "status": "Stopped",
+    "switch_active": False, # Estado físico del switch
+    "view_mode": "normal", 
+    "lap_count": 0.0,
+    "sensor_front": 0,
+    "sensor_left": 0,
+    "sensor_right": 0,
+    "visual_wall": False,
+    "is_stuck": False,
+    "chosen_direction": None,
+    "servo_angle": 70,
+    "motor_speed": 0,
+    "motor_enable_state": True,
+    "error_log": "Listo",
+    "config": default_config.copy() 
+}
 
-GPIO.setmode(GPIO.BCM)
-GPIO.setwarnings(False)
+# Variables internas
+lap_state = 0
+last_movement_ts = time.time()
+tof_stuck_counter = 0
+last_tof_readings = (0, 0)
+sensor_reset_timer = time.time()
 
-# Motor
-GPIO.setup(PIN_MOTOR_N1, GPIO.OUT)
-GPIO.setup(PIN_MOTOR_N2, GPIO.OUT)
-GPIO.setup(PIN_MOTOR_EN, GPIO.OUT)
-pwm_motor = GPIO.PWM(PIN_MOTOR_EN, 20000)  # 20 kHz
-pwm_motor.start(0)
+lock = threading.Lock()
 
-# Servo
-GPIO.setup(PIN_SERVO, GPIO.OUT)
-pwm_servo = GPIO.PWM(PIN_SERVO, 50)        # 50 Hz
-pwm_servo.start(SERVO_CENTER)
+# ==========================================
+# 2. GESTIÓN DE MEMORIA
+# ==========================================
+def load_config():
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, 'r') as f:
+                loaded = json.load(f)
+                for k, v in loaded.items():
+                    if k in robot_state["config"]:
+                        robot_state["config"][k] = v
+        except: pass
 
-# Ultrasónicos
-GPIO.setup(PIN_TRIG_FRONT, GPIO.OUT)
-GPIO.setup(PIN_ECHO_FRONT, GPIO.IN)
-GPIO.setup(PIN_TRIG_BACK, GPIO.OUT)
-GPIO.setup(PIN_ECHO_BACK, GPIO.IN)
-
-# VL53 XSHUT
-GPIO.setup(PIN_XSHUT_RIGHT, GPIO.OUT)
-GPIO.setup(PIN_XSHUT_LEFT, GPIO.OUT)
-
-# -------------------------------------------------
-# INICIALIZACIÓN VL53L0X
-# -------------------------------------------------
-try:
-    from VL53L0X import VL53L0X
-
-    GPIO.output(PIN_XSHUT_RIGHT, GPIO.LOW)
-    GPIO.output(PIN_XSHUT_LEFT, GPIO.LOW)
-    time.sleep(0.1)
-
-    # Derecha: encender y cambiar dirección
-    GPIO.output(PIN_XSHUT_RIGHT, GPIO.HIGH)
-    time.sleep(0.1)
-    tof_right = VL53L0X(address=0x29)
-    tof_right.change_address(0x2A)
-    time.sleep(0.1)
-
-    # Izquierda: encender con dirección por defecto
-    GPIO.output(PIN_XSHUT_LEFT, GPIO.HIGH)
-    time.sleep(0.1)
-    tof_left = VL53L0X(address=0x29)
-
-    tof_right.start_ranging(VL53L0X.BEST_ACCURACY_MODE)
-    tof_left.start_ranging(VL53L0X.BEST_ACCURACY_MODE)
-
-    VL53_AVAILABLE = True
-except Exception as e:
-    print("No se pudo inicializar VL53L0X:", e)
-    tof_right = None
-    tof_left = None
-    VL53_AVAILABLE = False
-
-# -------------------------------------------------
-# FUNCIONES BAJO NIVEL (motor / servo)
-# -------------------------------------------------
-
-def set_servo_center():
-    global current_servo_duty
-    current_servo_duty = SERVO_CENTER
-    pwm_servo.ChangeDutyCycle(current_servo_duty)
-
-def set_servo_turn_right():
-    global current_servo_duty
-    duty = SERVO_RIGHT if CLOCKWISE else SERVO_LEFT
-    current_servo_duty = duty
-    pwm_servo.ChangeDutyCycle(duty)
-
-def set_servo_turn_left():
-    global current_servo_duty
-    duty = SERVO_LEFT if CLOCKWISE else SERVO_RIGHT
-    current_servo_duty = duty
-    pwm_servo.ChangeDutyCycle(duty)
-
-def motor_stop():
-    global current_motor_speed
-    GPIO.output(PIN_MOTOR_N1, GPIO.LOW)
-    GPIO.output(PIN_MOTOR_N2, GPIO.LOW)
-    pwm_motor.ChangeDutyCycle(0)
-    current_motor_speed = 0
-
-def motor_forward(speed):
-    global current_motor_speed
-    GPIO.output(PIN_MOTOR_N1, GPIO.HIGH)
-    GPIO.output(PIN_MOTOR_N2, GPIO.LOW)
-    pwm_motor.ChangeDutyCycle(speed)
-    current_motor_speed = abs(speed)
-
-def motor_backward(speed):
-    global current_motor_speed
-    GPIO.output(PIN_MOTOR_N1, GPIO.LOW)
-    GPIO.output(PIN_MOTOR_N2, GPIO.HIGH)
-    pwm_motor.ChangeDutyCycle(speed)
-    current_motor_speed = -abs(speed)
-
-# -------------------------------------------------
-# ULTRASÓNICOS / VL53
-# -------------------------------------------------
-
-def read_ultrasonic(trig_pin, echo_pin, name_key, timeout=0.03):
-    GPIO.output(trig_pin, GPIO.LOW)
-    time.sleep(0.000002)
-    GPIO.output(trig_pin, GPIO.HIGH)
-    time.sleep(0.00001)
-    GPIO.output(trig_pin, GPIO.LOW)
-
-    start_time = time.time()
-    while GPIO.input(echo_pin) == 0:
-        if time.time() - start_time > timeout:
-            last_distances_mm[name_key] = None
-            return None
-    pulse_start = time.time()
-
-    while GPIO.input(echo_pin) == 1:
-        if time.time() - pulse_start > timeout:
-            last_distances_mm[name_key] = None
-            return None
-    pulse_end = time.time()
-
-    pulse_duration = pulse_end - pulse_start
-    distance_cm = (pulse_duration * 34300) / 2.0
-    distance_mm = distance_cm * 10.0
-    last_distances_mm[name_key] = distance_mm
-    return distance_cm
-
-def read_front_distance():
-    return read_ultrasonic(PIN_TRIG_FRONT, PIN_ECHO_FRONT, "front")
-
-def read_back_distance():
-    return read_ultrasonic(PIN_TRIG_BACK, PIN_ECHO_BACK, "back")
-
-def read_side_distances():
-    if not VL53_AVAILABLE:
-        last_distances_mm["right"] = None
-        last_distances_mm["left"] = None
-        return None, None
+def save_config():
     try:
-        d_right_mm = tof_right.get_distance()
-        d_left_mm  = tof_left.get_distance()
-        last_distances_mm["right"] = d_right_mm
-        last_distances_mm["left"]  = d_left_mm
-        return d_right_mm / 10.0, d_left_mm / 10.0  # cm
-    except Exception:
-        last_distances_mm["right"] = None
-        last_distances_mm["left"] = None
-        return None, None
+        with open(CONFIG_FILE, 'w') as f:
+            json.dump(robot_state["config"], f, indent=4)
+    except: pass
 
-# -------------------------------------------------
-# VISIÓN
-# -------------------------------------------------
+load_config()
 
-def process_frame(frame):
-    """
-    Devuelve:
-    - white_ratio: proporción de blancos en la ROI
-    - balance: diferencia de blanco izquierda-derecha
-    """
-    frame_resized = cv2.resize(frame, (320, 240))
-    roi = frame_resized[120:240, :]   # mitad inferior
+# ==========================================
+# 3. INTERFAZ HTML
+# ==========================================
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Robot Control Center</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body { background-color: #f8f9fa; color: #343a40; font-family: 'Segoe UI', sans-serif; }
+        .card { background-color: #ffffff; border: 1px solid #e9ecef; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.02); margin-bottom: 20px; }
+        .nav-tabs .nav-link { color: #6c757d; font-weight: 500; border: none; }
+        .nav-tabs .nav-link.active { color: #0d6efd; border-bottom: 2px solid #0d6efd; background: transparent; }
+        label { font-size: 0.85rem; color: #495057; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }
+        .val-badge { background: #e9ecef; color: #212529; padding: 2px 8px; border-radius: 4px; font-size: 0.8rem; font-family: monospace; float: right; }
+        .camera-feed { width: 100%; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); background: #000; min-height: 240px; }
+        .sensor-val { font-size: 1.5rem; font-weight: 700; color: #0d6efd; display: block; }
+        .status-badge { font-size: 0.9rem; padding: 5px 10px; border-radius: 20px; }
+        .bg-running { background-color: #d1e7dd; color: #0f5132; }
+        .bg-stopped { background-color: #f8d7da; color: #842029; }
+        .bg-switch { background-color: #fff3cd; color: #856404; border: 1px solid #ffeeba; }
+    </style>
+</head>
+<body>
+    <div class="container py-4">
+        <div class="d-flex justify-content-between align-items-center mb-4">
+            <h4 class="m-0">🏎️ Robot Dashboard</h4>
+            <div id="switch-indicator" class="d-none status-badge bg-switch fw-bold">⚠️ SWITCH FÍSICO ACTIVO</div>
+            <button class="btn btn-outline-secondary btn-sm" onclick="location.reload()">🔄 UI Reset</button>
+        </div>
 
-    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    _, thresh = cv2.threshold(gray, 160, 255, cv2.THRESH_BINARY)
+        <div class="row">
+            <div class="col-lg-7">
+                <div class="card p-3">
+                    <div class="position-relative">
+                        <img src="/video_feed" class="camera-feed" id="cam-feed">
+                        <div id="alert-overlay" class="position-absolute top-50 start-50 translate-middle text-center d-none" style="background: rgba(255,0,0,0.8); padding: 15px; border-radius: 8px; color: white;">
+                            <h3 class="m-0">🛑 OBSTÁCULO / ATASCO</h3>
+                        </div>
+                    </div>
+                    <div class="row mt-3 text-center">
+                        <div class="col-4"><small class="text-muted">IZQ</small><br><span id="val-left" class="sensor-val">0</span>mm</div>
+                        <div class="col-4"><small class="text-muted">FRENTE</small><br><span id="val-front" class="sensor-val">0</span>cm</div>
+                        <div class="col-4"><small class="text-muted">DER</small><br><span id="val-right" class="sensor-val">0</span>mm</div>
+                    </div>
+                    <div class="d-flex justify-content-between align-items-center mt-3">
+                        <small class="text-muted" id="err-log">Sistema OK</small>
+                        <button class="btn btn-sm btn-light border" onclick="toggleView()">👁️ Ver Procesado</button>
+                    </div>
+                </div>
+            </div>
 
-    white_pixels = np.count_nonzero(thresh == 255)
-    total_pixels = thresh.size
-    white_ratio = white_pixels / float(total_pixels)
+            <div class="col-lg-5">
+                <div class="card p-2 mb-3">
+                    <div class="btn-group w-100" role="group">
+                        <input type="radio" class="btn-check" name="btnradio" id="btn-manual" autocomplete="off" checked onclick="setMode('Manual')">
+                        <label class="btn btn-outline-primary" for="btn-manual">🎮 Manual</label>
+                        <input type="radio" class="btn-check" name="btnradio" id="btn-auto" autocomplete="off" onclick="setMode('Auto')">
+                        <label class="btn btn-outline-primary" for="btn-auto">🤖 Autónomo</label>
+                    </div>
+                </div>
 
-    left_roi = thresh[:, :160]
-    right_roi = thresh[:, 160:]
-    white_left = np.count_nonzero(left_roi == 255)
-    white_right = np.count_nonzero(right_roi == 255)
-    if white_left + white_right == 0:
-        balance = 0.0
-    else:
-        balance = (white_left - white_right) / float(white_left + white_right)
+                <div class="card p-3" style="min-height: 400px;">
+                    <ul class="nav nav-tabs mb-3" id="myTab" role="tablist">
+                        <li class="nav-item"><a class="nav-link active" data-bs-toggle="tab" href="#tab-main">Control</a></li>
+                        <li class="nav-item"><a class="nav-link" data-bs-toggle="tab" href="#tab-calib">Calibración</a></li>
+                        <li class="nav-item"><a class="nav-link" data-bs-toggle="tab" href="#tab-diag">Hardware</a></li>
+                    </ul>
 
-    return white_ratio, balance
+                    <div class="tab-content">
+                        <!-- TAB PRINCIPAL -->
+                        <div class="tab-pane fade show active" id="tab-main">
+                            <div id="panel-manual">
+                                <label>Dirección <span class="val-badge" id="v-m-steer"></span></label>
+                                <input type="range" class="form-range" min="40" max="100" id="man-steer" oninput="sendManual()">
+                                <div class="text-center mb-3"><button class="btn btn-sm btn-light border" onclick="resetSteer()">Centrar</button></div>
+                                <label>Motor <span class="val-badge" id="v-m-throt"></span></label>
+                                <input type="range" class="form-range" min="-100" max="100" step="10" id="man-throt" oninput="sendManual()">
+                                <button class="btn btn-danger w-100 mt-3 btn-custom" onclick="stopAll()">🛑 FRENO DE EMERGENCIA</button>
+                            </div>
+                            <div id="panel-auto" class="d-none">
+                                <div class="text-center mb-4">
+                                    <span id="status-badge" class="status-badge bg-stopped">DETENIDO</span>
+                                    <div class="mt-2">Vueltas: <span class="h3 fw-bold" id="lap-count">0.00</span></div>
+                                    <div class="mt-1 text-muted"><small id="dir-status">Esperando...</small></div>
+                                </div>
+                                <div class="d-grid gap-2">
+                                    <button class="btn btn-success btn-custom" onclick="sendCommand('start')">▶ INICIAR CARRERA</button>
+                                    <button class="btn btn-danger btn-custom" onclick="sendCommand('stop')">⏹ DETENER</button>
+                                    <button class="btn btn-outline-secondary btn-sm mt-2" onclick="sendCommand('reset_laps')">↺ Reset Vueltas</button>
+                                </div>
+                            </div>
+                        </div>
 
-# -------------------------------------------------
-# GUI / HUD SOBRE EL FRAME
-# -------------------------------------------------
+                        <!-- TAB CALIBRACIÓN -->
+                        <div class="tab-pane fade" id="tab-calib">
+                            <div style="height: 350px; overflow-y: auto; padding-right: 5px;">
+                                <h6 class="text-primary mt-2">🏎️ Navegación (0-100)</h6>
+                                <div class="mb-2"><label>Vel. Recta <span class="val-badge" id="v-spd"></span></label><input type="range" class="form-range" min="0" max="100" id="sl-spd" onchange="upd()"></div>
+                                <div class="mb-2"><label>Vel. Reversa <span class="val-badge" id="v-rev-spd"></span></label><input type="range" class="form-range" min="0" max="100" id="sl-rev-spd" onchange="upd()"></div>
+                                
+                                <h6 class="text-primary mt-3">⏱️ Distancias & Tiempos</h6>
+                                <div class="mb-2"><label>Dist. Frontal Choque (cm) <span class="val-badge" id="v-dist"></span></label><input type="range" class="form-range" min="10" max="60" id="sl-dist" onchange="upd()"></div>
+                                <div class="mb-2"><label>Dist. Atasco Lateral (mm) <span class="val-badge" id="v-side-stuck"></span></label><input type="range" class="form-range" min="0" max="150" id="sl-side-stuck" onchange="upd()"></div>
+                                <div class="mb-2"><label>Tiempo Reversa (s) <span class="val-badge" id="v-rev-time"></span></label><input type="range" class="form-range" min="0" max="3" step="0.1" id="sl-rev-time" onchange="upd()"></div>
 
-def duty_to_angle(duty):
-    """
-    Conversión aproximada de duty 5-10% a 0-180°
-    (ajustar si tu servo usa otro rango).
-    """
-    return (duty - 5.0) * (180.0 / 5.0)
+                                <h6 class="text-primary mt-3">🎨 Colores (0-255)</h6>
+                                <div class="mb-2"><label>Negro Máx <span class="val-badge" id="v-black"></span></label><input type="range" class="form-range" min="0" max="255" id="sl-black" onchange="upd()"></div>
+                                <div class="mb-2"><label>Blanco Mín <span class="val-badge" id="v-white"></span></label><input type="range" class="form-range" min="0" max="255" id="sl-white" onchange="upd()"></div>
+                                <div class="mb-2"><label>Sat Mín <span class="val-badge" id="v-sat"></span></label><input type="range" class="form-range" min="0" max="255" id="sl-sat" onchange="upd()"></div>
+                                
+                                <h6 class="text-primary mt-3">⚙️ Servo</h6>
+                                <div class="mb-2"><label>Centro <span class="val-badge" id="v-center"></span></label><input type="range" class="form-range" min="50" max="90" id="sl-center" onchange="upd()"></div>
+                                <div class="mb-2"><label>Izq (Min) <span class="val-badge" id="v-min"></span></label><input type="range" class="form-range" min="10" max="60" id="sl-min" onchange="upd()"></div>
+                                <div class="mb-2"><label>Der (Max) <span class="val-badge" id="v-max"></span></label><input type="range" class="form-range" min="80" max="140" id="sl-max" onchange="upd()"></div>
+                            </div>
+                        </div>
 
-def draw_hud(frame):
-    """
-    Dibuja cámara + texto de estado sobre el frame.
-    Usa variables globales de estado.
-    """
-    global current_motor_speed, current_servo_duty, current_routine, last_distances_mm
+                        <!-- TAB DIAGNOSTICO -->
+                        <div class="tab-pane fade" id="tab-diag">
+                            <div class="alert alert-light border">
+                                <small class="d-block fw-bold text-muted">DRIVER MOTOR</small>
+                                <h5 id="st-enable" class="text-success">ACTIVADO</h5>
+                                <button class="btn btn-sm btn-outline-dark w-100 mt-1" onclick="sendCommand('toggle_enable')">Apagar/Encender</button>
+                            </div>
+                            <button class="btn btn-info w-100 shadow-sm" onclick="sendCommand('reset_sensors')">🔄 Reiniciar Sensores</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
 
-    # Redimensionar para que quepa todo
-    frame = cv2.resize(frame, (640, 480))
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        let currentMode = 'Manual';
+        
+        setInterval(async () => {
+            try {
+                const res = await fetch('/api/status');
+                const data = await res.json();
+                const cfg = data.config;
 
-    # Panel semitransparente
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (0, 0), (640, 140), (0, 0, 0), -1)
-    alpha = 0.6
-    frame = cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0)
+                document.getElementById('val-front').innerText = data.sensor_front;
+                document.getElementById('val-left').innerText = data.sensor_left;
+                document.getElementById('val-right').innerText = data.sensor_right;
+                document.getElementById('lap-count').innerText = data.lap_count.toFixed(2);
+                document.getElementById('err-log').innerText = data.error_log;
+                
+                if(data.chosen_direction) {
+                    document.getElementById('dir-status').innerText = "Giro Decidido: " + (data.chosen_direction == 'left' ? "IZQUIERDA" : "DERECHA");
+                } else {
+                    document.getElementById('dir-status').innerText = "Esperando decisión...";
+                }
 
-    # Texto principal
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    color_text = (255, 255, 255)
-    y = 25
+                if(data.visual_wall || data.sensor_front < cfg.min_front_dist || data.is_stuck) {
+                    document.getElementById('alert-overlay').classList.remove('d-none');
+                } else {
+                    document.getElementById('alert-overlay').classList.add('d-none');
+                }
 
-    # Rutina actual
-    cv2.putText(frame, f"Rutina: {current_routine}", (10, y),
-                font, 0.6, color_text, 1, cv2.LINE_AA)
-    y += 25
+                // Switch Indicator
+                if(data.switch_active) {
+                    document.getElementById('switch-indicator').classList.remove('d-none');
+                } else {
+                    document.getElementById('switch-indicator').classList.add('d-none');
+                }
 
-    # Velocidad del motor
-    if current_motor_speed > 0:
-        sentido = "Avance"
-    elif current_motor_speed < 0:
-        sentido = "Reversa"
-    else:
-        sentido = "Detenido"
+                const badge = document.getElementById('status-badge');
+                if(data.status === 'Running') {
+                    badge.innerText = "CORRIENDO"; badge.className = "status-badge bg-running";
+                } else {
+                    badge.innerText = "DETENIDO"; badge.className = "status-badge bg-stopped";
+                }
+                
+                const enSpan = document.getElementById('st-enable');
+                enSpan.innerText = data.motor_enable_state ? "ON" : "OFF";
+                enSpan.className = data.motor_enable_state ? "fw-bold text-success" : "fw-bold text-danger";
 
-    cv2.putText(frame,
-                f"Motor: {abs(current_motor_speed):3.0f}% ({sentido})",
-                (10, y), font, 0.6, color_text, 1, cv2.LINE_AA)
-    y += 25
+                if(document.activeElement.tagName !== "INPUT" && document.activeElement.tagName !== "SELECT") {
+                    sync('sl-spd', 'v-spd', cfg.base_speed);
+                    sync('sl-rev-spd', 'v-rev-spd', cfg.reverse_speed);
+                    
+                    sync('sl-rev-time', 'v-rev-time', cfg.reverse_time);
+                    sync('sl-dist', 'v-dist', cfg.min_front_dist);
+                    sync('sl-side-stuck', 'v-side-stuck', cfg.side_stuck_dist);
+                    
+                    sync('sl-black', 'v-black', cfg.black_max_v);
+                    sync('sl-white', 'v-white', cfg.white_min_v);
+                    sync('sl-sat', 'v-sat', cfg.sat_min);
+                    
+                    sync('sl-center', 'v-center', cfg.servo_center);
+                    sync('sl-min', 'v-min', cfg.servo_min);
+                    sync('sl-max', 'v-max', cfg.servo_max);
+                }
+            } catch(e){}
+        }, 500);
 
-    # Ángulo del servo
-    angle = duty_to_angle(current_servo_duty)
-    cv2.putText(frame,
-                f"Servo: {angle:5.1f} grados",
-                (10, y), font, 0.6, color_text, 1, cv2.LINE_AA)
-    y += 30
+        function sync(idSl, idLbl, val) {
+            const el = document.getElementById(idSl);
+            if(el) el.value = val;
+            const lbl = document.getElementById(idLbl);
+            if(lbl) lbl.innerText = val;
+        }
 
-    # Tabla de distancias
-    cv2.putText(frame, "Distancias (mm):", (10, y),
-                font, 0.6, color_text, 1, cv2.LINE_AA)
-    y += 22
+        async function setMode(m) {
+            currentMode = m;
+            document.getElementById('panel-manual').className = m === 'Manual' ? 'd-block' : 'd-none';
+            document.getElementById('panel-auto').className = m === 'Auto' ? 'd-block' : 'd-none';
+            await stopAll();
+            await fetch('/api/control', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({command:'set_mode', mode:m})});
+        }
 
-    def fmt(name):
-        val = last_distances_mm[name]
-        return "---" if val is None else f"{val:7.1f}"
+        async function toggleView() { await fetch('/api/control', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({command:'toggle_view'})}); }
+        async function sendCommand(c) { await fetch('/api/control', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({command:c})}); }
+        async function stopAll() { document.getElementById('man-throt').value = 0; sendManual(); sendCommand('stop'); }
+        async function testPulse(s) { await fetch('/api/control', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({command:'test_pulse', speed:s})}); }
+        
+        async function sendManual() {
+            if(currentMode !== 'Manual') return;
+            const angle = document.getElementById('man-steer').value;
+            const speed = document.getElementById('man-throt').value;
+            document.getElementById('v-m-steer').innerText = angle;
+            document.getElementById('v-m-throt').innerText = speed;
+            await fetch('/api/control', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({command:'manual', angle:parseInt(angle), speed:parseInt(speed)})});
+        }
+        function resetSteer() { document.getElementById('man-steer').value = 70; sendManual(); }
 
-    cv2.putText(frame, f"Front: {fmt('front')}", (20, y),
-                font, 0.5, color_text, 1, cv2.LINE_AA)
-    y += 20
-    cv2.putText(frame, f"Back : {fmt('back')}", (20, y),
-                font, 0.5, color_text, 1, cv2.LINE_AA)
-    y += 20
-    cv2.putText(frame, f"Right: {fmt('right')}", (20, y),
-                font, 0.5, color_text, 1, cv2.LINE_AA)
-    y += 20
-    cv2.putText(frame, f"Left : {fmt('left')}", (20, y),
-                font, 0.5, color_text, 1, cv2.LINE_AA)
+        async function upd() {
+            const cfg = {
+                base_speed: parseInt(document.getElementById('sl-spd').value),
+                reverse_speed: parseInt(document.getElementById('sl-rev-spd').value),
+                reverse_time: parseFloat(document.getElementById('sl-rev-time').value),
+                min_front_dist: parseInt(document.getElementById('sl-dist').value),
+                side_stuck_dist: parseInt(document.getElementById('sl-side-stuck').value),
+                
+                black_max_v: parseInt(document.getElementById('sl-black').value),
+                white_min_v: parseInt(document.getElementById('sl-white').value),
+                sat_min: parseInt(document.getElementById('sl-sat').value),
+                
+                servo_center: parseInt(document.getElementById('sl-center').value),
+                servo_min: parseInt(document.getElementById('sl-min').value),
+                servo_max: parseInt(document.getElementById('sl-max').value)
+            };
+            sync('sl-spd', 'v-spd', cfg.base_speed); 
+            await fetch('/api/config', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(cfg)});
+        }
+    </script>
+</body>
+</html>
+"""
 
-    # Instrucción de salida
-    cv2.putText(frame, "Presiona 'q' para salir",
-                (360, 470), font, 0.6, (0, 255, 255), 1, cv2.LINE_AA)
+# ==========================================
+# 4. HARDWARE (SWITCH + SENSORES)
+# ==========================================
+class HardwareInterface:
+    def __init__(self):
+        GPIO.setmode(GPIO.BCM)
+        GPIO.setwarnings(False)
+        GPIO.setup(TRIG_FRONT, GPIO.OUT)
+        GPIO.setup(ECHO_FRONT, GPIO.IN)
+        GPIO.setup(XSHUT_LEFT, GPIO.OUT)
+        GPIO.setup(XSHUT_RIGHT, GPIO.OUT)
+        GPIO.setup(SERVO_PIN, GPIO.OUT)
+        GPIO.setup(MOTOR_RPWM, GPIO.OUT)
+        GPIO.setup(MOTOR_LPWM, GPIO.OUT)
+        GPIO.setup(MOTOR_ENABLE, GPIO.OUT)
+        
+        # SWITCH DE COMPETENCIA
+        GPIO.setup(SWITCH_PWR_PIN, GPIO.OUT)
+        GPIO.output(SWITCH_PWR_PIN, GPIO.HIGH) # 3.3V constante
+        GPIO.setup(SWITCH_READ_PIN, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
 
-    return frame
+        self.pwm_servo = GPIO.PWM(SERVO_PIN, 50)
+        self.pwm_servo.start(0) 
+        self.pwm_r = GPIO.PWM(MOTOR_RPWM, 1000)
+        self.pwm_l = GPIO.PWM(MOTOR_LPWM, 1000)
+        self.pwm_r.start(0)
+        self.pwm_l.start(0)
+        
+        GPIO.output(MOTOR_ENABLE, GPIO.HIGH)
+        
+        self.tof_left = None; self.tof_right = None; self.i2c = None
+        self.last_valid_dist = 400
+        self.init_tof_sensors()
+        self.servo_timer = None 
 
-# -------------------------------------------------
-# COMPORTAMIENTO ALTO NIVEL
-# -------------------------------------------------
+    def init_tof_sensors(self):
+        print("🔧 Reiniciando Sensores I2C...")
+        try:
+            if self.i2c: self.i2c.deinit()
+            time.sleep(0.2)
+            self.i2c = busio.I2C(board.SCL, board.SDA)
+            
+            GPIO.output(XSHUT_LEFT, GPIO.LOW); GPIO.output(XSHUT_RIGHT, GPIO.LOW); time.sleep(0.1)
+            
+            GPIO.output(XSHUT_LEFT, GPIO.HIGH); time.sleep(0.1)
+            self.tof_left = VL53L0X(self.i2c); self.tof_left.set_address(0x30)
+            
+            GPIO.output(XSHUT_RIGHT, GPIO.HIGH); time.sleep(0.1)
+            self.tof_right = VL53L0X(self.i2c)
+        except Exception as e:
+            print(f"Error I2C: {e}")
 
-def adjust_steering(balance):
-    """
-    Ajuste simple según balance de blanco izquierda/derecha.
-    """
-    if abs(balance) < 0.1:
-        set_servo_center()
-        return
-    if balance > 0:
-        set_servo_turn_left()
-    else:
-        set_servo_turn_right()
+    def read_ultrasonic(self):
+        try:
+            GPIO.output(TRIG_FRONT, True); time.sleep(0.00001); GPIO.output(TRIG_FRONT, False)
+            start = time.time(); timeout = start + 0.04 
+            while GPIO.input(ECHO_FRONT) == 0:
+                start = time.time(); 
+                if start > timeout: return 400
+            stop = time.time()
+            while GPIO.input(ECHO_FRONT) == 1:
+                stop = time.time()
+                if stop > timeout: return 400
+            dist = ((stop - start) * 34300) / 2
+            if dist > 500 or dist < 0: return 500
+            return dist
+        except: return 500
 
-def avoid_obstacle(front_dist, back_dist, cap):
-    """
-    - Detenerse
-    - Retroceder (si hay espacio)
-    - Girar en el sentido principal hasta volver a ver blanco
-    Mostrando la GUI en todo el proceso.
-    """
-    global current_routine
+    def read_tof(self):
+        try:
+            l = self.tof_left.range if self.tof_left else 0
+            r = self.tof_right.range if self.tof_right else 0
+            if l == 0 and r == 0: self.init_tof_sensors(); return 2000, 2000
+            if l > 2000: l = 2000
+            if r > 2000: r = 2000
+            return l, r
+        except:
+            self.init_tof_sensors()
+            return 2000, 2000
+    
+    def check_switch(self):
+        return GPIO.input(SWITCH_READ_PIN) == GPIO.HIGH
 
-    # Detener
-    current_routine = "Detenido por obstaculo"
-    motor_stop()
-    time.sleep(0.2)
+    def _disable_servo(self):
+        self.pwm_servo.ChangeDutyCycle(0) 
 
-    # Retroceder
-    if back_dist is None or back_dist > BACK_SAFE_DIST:
-        current_routine = "Evitando: retrocediendo"
-        set_servo_center()
-        t0 = time.time()
-        motor_backward(MOTOR_SPEED_SLOW)
-        while time.time() - t0 < 0.5:
-            ret, frame = cap.read()
-            if not ret:
-                continue
-            frame_hud = draw_hud(frame)
-            cv2.imshow("Carrito - Vision y Telemetria", frame_hud)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                motor_stop()
-                return True  # salir de todo
-        motor_stop()
-        time.sleep(0.1)
+    def set_actuators(self, angle, speed):
+        # Anti-Temblor
+        if angle != robot_state["servo_angle"]:
+            duty = 2.5 + (angle / 18.0)
+            self.pwm_servo.ChangeDutyCycle(duty)
+            robot_state["servo_angle"] = int(angle)
+            if self.servo_timer: self.servo_timer.cancel()
+            self.servo_timer = threading.Timer(0.3, self._disable_servo)
+            self.servo_timer.start()
+        
+        # Motor
+        robot_state["motor_speed"] = speed
+        if speed > 0:
+            self.pwm_r.ChangeDutyCycle(speed); self.pwm_l.ChangeDutyCycle(0)
+        elif speed < 0:
+            self.pwm_r.ChangeDutyCycle(0); self.pwm_l.ChangeDutyCycle(abs(speed))
+        else:
+            self.pwm_r.ChangeDutyCycle(0); self.pwm_l.ChangeDutyCycle(0)
 
-    # Girar buscando blanco
-    current_routine = "Evitando: girando/buscando blanco"
-    if CLOCKWISE:
-        set_servo_turn_right()
-    else:
-        set_servo_turn_left()
-    motor_forward(MOTOR_SPEED_SLOW)
+    def toggle_enable(self):
+        st = not robot_state["motor_enable_state"]
+        GPIO.output(MOTOR_ENABLE, GPIO.HIGH if st else GPIO.LOW)
+        robot_state["motor_enable_state"] = st
 
-    turn_start = time.time()
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            continue
-        white_ratio, _ = process_frame(frame)
-        frame_hud = draw_hud(frame)
-        cv2.imshow("Carrito - Vision y Telemetria", frame_hud)
+hw = HardwareInterface()
 
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord('q'):
-            motor_stop()
-            return True  # terminar programa
+# ==========================================
+# 5. VISIÓN (BAJA LATENCIA + BLANCO PURO)
+# ==========================================
+class VisionSystem:
+    def __init__(self):
+        self.cap = cv2.VideoCapture(0)
+        self.cap.set(3, FRAME_WIDTH)
+        self.cap.set(4, FRAME_HEIGHT)
+        self.last_frame_gray = None
+        self.last_move_time = time.time()
 
-        if white_ratio > WHITE_GO_THRESHOLD:
-            break
-        if time.time() - turn_start > MAX_TURN_TIME:
-            break
+    def process_frame(self):
+        try:
+            ret, frame = self.cap.read()
+            if not ret: return None
+            
+            cfg = robot_state["config"]
+            h_img, w_img = frame.shape[:2]
+            
+            y_start = int(h_img * cfg["roi_top"] / 100)
+            y_end = int(h_img * cfg["roi_bottom"] / 100)
+            if y_start >= y_end: y_start = 0; y_end = h_img
+            
+            mask_roi = np.zeros((h_img, w_img), dtype=np.uint8)
+            mask_roi[y_start:y_end, :] = 255
+            is_inside = (mask_roi == 255)
+            
+            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+            v_channel = hsv[:,:,2]
+            s_channel = hsv[:,:,1]
+            
+            mask_black = (v_channel < cfg["black_max_v"]) & is_inside
+            mask_white = (v_channel > cfg["white_min_v"]) & (s_channel < cfg["sat_min"]) & is_inside
+            
+            # Detección Pared Visual
+            roi_h = y_end - y_start
+            box_y = y_start + int(roi_h * 0.5)
+            box_h = int(roi_h * 0.5)
+            det_mask = mask_black[box_y : box_y+box_h, int(w_img*0.3) : int(w_img*0.7)]
+            
+            is_wall = False
+            if det_mask.size > 0:
+                if (np.count_nonzero(det_mask) / det_mask.size) > 0.4: is_wall = True
+            robot_state["visual_wall"] = is_wall
 
-    motor_stop()
-    set_servo_center()
-    time.sleep(0.1)
-    return False
-
-# -------------------------------------------------
-# PROGRAMA PRINCIPAL
-# -------------------------------------------------
-
-def main():
-    global current_routine
-
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        print("No se pudo abrir la camara")
-        return
-
-    print("Iniciando recorrido...")
-    current_routine = "Iniciando recorrido"
-
-    start_time = time.time()
-    end_time = start_time + NUM_LAPS * LAP_TIME_SEC
-
-    try:
-        while time.time() < end_time:
-            ret, frame = cap.read()
-            if not ret:
-                print("Frame no valido")
-                continue
-
-            white_ratio, balance = process_frame(frame)
-            front_dist = read_front_distance()
-            back_dist  = read_back_distance()
-            side_right, side_left = read_side_distances()
-
-            # 1) Obstáculo frontal
-            if front_dist is not None and front_dist < FRONT_STOP_DIST:
-                salir = avoid_obstacle(front_dist, back_dist, cap)
-                if salir:
-                    break
-                continue
-
-            # 2) Piso muy negro (perdimos la ruta)
-            if white_ratio < WHITE_LOST_THRESHOLD:
-                current_routine = "Buscando piso blanco"
-                motor_stop()
-                salir = avoid_obstacle(front_dist, back_dist, cap)
-                if salir:
-                    break
-                continue
-
-            # 3) Piso mayormente blanco
-            if white_ratio > WHITE_GO_THRESHOLD:
-                current_routine = "Avanzando rapido"
-                adjust_steering(balance)
-                motor_forward(MOTOR_SPEED_MAX)
+            # VISUALIZACIÓN
+            if robot_state["view_mode"] == 'debug':
+                display = np.full_like(frame, 50) 
+                display[mask_white] = [255, 255, 255]
+                display[mask_black] = [0, 0, 0]
+                cv2.rectangle(display, (0, y_start), (w_img, y_end), (0, 255, 0), 2)
+                return cv2.imencode('.jpg', display)[1].tobytes()
             else:
-                current_routine = "Avanzando lento"
-                adjust_steering(balance)
-                motor_forward(MOTOR_SPEED_SLOW)
+                cv2.rectangle(frame, (0, y_start), (w_img, y_end), (0, 255, 0), 1)
+                return cv2.imencode('.jpg', frame)[1].tobytes()
+                
+        except Exception as e: return None
 
-            # Dibuja interfaz
-            frame_hud = draw_hud(frame)
-            cv2.imshow("Carrito - Vision y Telemetria", frame_hud)
+vision = VisionSystem()
 
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
-                current_routine = "Detenido por usuario"
-                break
+# ==========================================
+# 6. BUCLE AUTÓNOMO (REACTIVO + SWITCH)
+# ==========================================
+def autonomous_loop():
+    global last_movement_ts, tof_stuck_counter, last_tof_readings, sensor_reset_timer
+    
+    while True:
+        try:
+            time.sleep(0.05)
+            
+            # --- 1. LECTURA SWITCH COMPETENCIA ---
+            is_switch_on = hw.check_switch()
+            robot_state["switch_active"] = is_switch_on
+            
+            if is_switch_on:
+                if robot_state["mode"] != "Auto" or robot_state["status"] != "Running":
+                    print("⚠️ SWITCH ACTIVADO: Iniciando Carrera Autónoma")
+                    robot_state["mode"] = "Auto"
+                    robot_state["status"] = "Running"
+                    robot_state["chosen_direction"] = None
+            else:
+                # Si el switch se apaga y estábamos corriendo por switch, parar.
+                # (Pero permitir control manual si se activó por web)
+                pass 
 
-            time.sleep(0.03)
+            # --- 2. LECTURA SENSORES ---
+            dist_f = hw.read_ultrasonic()
+            dist_l, dist_r = hw.read_tof()
+            
+            robot_state["sensor_front"] = int(dist_f)
+            robot_state["sensor_left"] = int(dist_l)
+            robot_state["sensor_right"] = int(dist_r)
+            
+            _ = vision.process_frame()
+            cfg = robot_state["config"]
 
-        current_routine = "Vueltas completadas"
-        motor_stop()
-        set_servo_center()
-        # mostrar ultimo frame un momento
-        ret, frame = cap.read()
-        if ret:
-            frame_hud = draw_hud(frame)
-            cv2.imshow("Carrito - Vision y Telemetria", frame_hud)
-            cv2.waitKey(2000)
+            # Auto-Reset Sensores periódico
+            if (time.time() - sensor_reset_timer > 10) and robot_state["motor_speed"] == 0:
+                hw.init_tof_sensors()
+                sensor_reset_timer = time.time()
 
-    except KeyboardInterrupt:
-        print("Interrupcion con Ctrl+C")
+            if robot_state["mode"] != "Auto" or robot_state["status"] != "Running":
+                if robot_state["mode"] == "Auto": hw.set_actuators(cfg["servo_center"], 0)
+                continue
 
-    finally:
-        motor_stop()
-        set_servo_center()
-        cap.release()
-        pwm_servo.stop()
-        pwm_motor.stop()
-        GPIO.cleanup()
-        cv2.destroyAllWindows()
-        if VL53_AVAILABLE:
-            try:
-                tof_right.stop_ranging()
-                tof_left.stop_ranging()
-            except Exception:
-                pass
+            # --- 3. LÓGICA DE ATASCOS ---
+            
+            # A) Atasco Lateral (Por Sensor)
+            side_stuck = (dist_r < cfg["side_stuck_dist"]) or (dist_l < cfg["side_stuck_dist"])
+            
+            # B) Watchdog de Movimiento
+            curr_readings = (dist_l, dist_r)
+            diff_l = abs(curr_readings[0] - last_tof_readings[0])
+            diff_r = abs(curr_readings[1] - last_tof_readings[1])
+            
+            if robot_state["motor_speed"] > 20:
+                if diff_l < 5 and diff_r < 5: tof_stuck_counter += 1
+                else: 
+                    tof_stuck_counter = 0
+                    last_movement_ts = time.time()
+            else: last_movement_ts = time.time()
+            last_tof_readings = curr_readings
+            
+            stuck_trigger = (tof_stuck_counter > 60) or (time.time() - last_movement_ts > 5.0)
 
+            # --- 4. SECUENCIA DE EVASIÓN ---
+            should_evade = False
+            
+            if dist_f < cfg["min_front_dist"] or robot_state["visual_wall"]: should_evade = True
+            if side_stuck: should_evade = True; print("⚠️ Atasco Lateral Detectado")
+            if stuck_trigger: should_evade = True; print("⚠️ Atasco por Tiempo Detectado")
 
-if __name__ == "__main__":
-    main()
+            if should_evade:
+                hw.set_actuators(cfg["servo_center"], 0)
+                time.sleep(0.2)
+                
+                # Reversa
+                hw.set_actuators(cfg["servo_center"], -int(cfg["reverse_speed"]))
+                time.sleep(cfg["reverse_time"])
+                
+                # Decidir Dirección (Lado con más espacio)
+                if robot_state["chosen_direction"] is None:
+                    if dist_l > dist_r: robot_state["chosen_direction"] = 'left'
+                    else: robot_state["chosen_direction"] = 'right'
+                
+                if robot_state["chosen_direction"] == 'left': turn_angle = cfg["servo_min"]
+                else: turn_angle = cfg["servo_max"]
+                
+                # Girar y Avanzar
+                hw.set_actuators(turn_angle, 0); time.sleep(0.2)
+                hw.set_actuators(turn_angle, int(cfg["base_speed"]))
+                time.sleep(0.6)
+                
+                # Reversa Contrarrotada si estaba atascado
+                if stuck_trigger:
+                    opp_angle = cfg["servo_max"] if turn_angle == cfg["servo_min"] else cfg["servo_min"]
+                    hw.set_actuators(opp_angle, -int(cfg["reverse_speed"]))
+                    time.sleep(0.4)
+                    hw.set_actuators(turn_angle, int(cfg["base_speed"]))
+                    time.sleep(0.4)
+
+                tof_stuck_counter = 0
+                last_movement_ts = time.time()
+                continue
+
+            # --- 5. NAVEGACIÓN RECTA ---
+            target_speed = cfg["base_speed"]
+            if dist_f < cfg["slow_dist"]: target_speed *= 0.6
+            hw.set_actuators(cfg["servo_center"], int(target_speed))
+
+        except Exception as e:
+            robot_state["error_log"] = str(e)
+            time.sleep(1)
+
+t = threading.Thread(target=autonomous_loop)
+t.daemon = True
+t.start()
+
+# ==========================================
+# 7. API WEB
+# ==========================================
+app = Flask(__name__)
+
+@app.route('/')
+def index(): return render_template_string(HTML_TEMPLATE)
+
+@app.route('/video_feed')
+def video_feed():
+    def gen():
+        while True:
+            frame = vision.process_frame()
+            if frame: yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+            else: time.sleep(0.1)
+    return Response(gen(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+@app.route('/api/status')
+def status(): return jsonify(robot_state)
+
+@app.route('/api/config', methods=['POST'])
+def update_config():
+    new_cfg = request.json
+    robot_state["config"].update(new_cfg)
+    save_config() 
+    return jsonify({"msg": "Saved"})
+
+@app.route('/api/control', methods=['POST'])
+def api_control():
+    data = request.json
+    cmd = data.get('command')
+    
+    if cmd == 'set_mode':
+        robot_state["mode"] = data.get('mode')
+        hw.set_actuators(robot_state["config"]["servo_center"], 0)
+        robot_state["status"] = "Stopped"
+        
+    elif cmd == 'toggle_view':
+        robot_state["view_mode"] = 'debug' if robot_state["view_mode"] == 'normal' else 'normal'
+        
+    elif cmd == 'manual':
+        hw.set_actuators(data.get('angle'), data.get('speed'))
+        
+    elif cmd == 'start': 
+        robot_state["status"] = "Running"
+        global last_movement_ts
+        last_movement_ts = time.time()
+        
+    elif cmd == 'stop': 
+        robot_state["status"] = "Stopped"
+        hw.set_actuators(robot_state["config"]["servo_center"], 0)
+    
+    elif cmd == 'reset_laps': robot_state["lap_count"] = 0
+    elif cmd == 'toggle_enable': hw.toggle_enable()
+    elif cmd == 'reset_sensors': hw.init_tof_sensors()
+    elif cmd == 'test_pulse':
+        hw.set_actuators(robot_state["config"]["servo_center"], data.get('speed'))
+        time.sleep(1.0)
+        hw.set_actuators(robot_state["config"]["servo_center"], 0)
+
+    return jsonify({"msg": "ok"})
+
+if __name__ == '__main__':
+    try: app.run(host='0.0.0.0', port=5000, debug=False)
+    finally: hw.set_actuators(70, 0); GPIO.cleanup()
